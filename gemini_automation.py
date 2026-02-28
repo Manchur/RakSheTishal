@@ -26,8 +26,21 @@ class GeminiAutomation:
         self.browser_context = None
         self.page = None
 
+    def _cleanup_zombie_processes(self):
+        """Kills any existing Chrome processes locked to our user data dir to prevent hangs."""
+        import subprocess
+        import platform
+        if platform.system() == "Windows":
+            try:
+                # Use powershell to find and kill chrome processes matching the user_data_dir path
+                cmd = "Get-CimInstance Win32_Process -Filter \\\"Name='chrome.exe'\\\" | Where-Object {$_.CommandLine -match 'chrome-user-data'} | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }"
+                subprocess.run(["powershell", "-Command", cmd], capture_output=True, text=True, creationflags=subprocess.CREATE_NO_WINDOW)
+            except Exception:
+                pass
+
     async def start_session(self, gem_id: str = None) -> bool:
         """Starts the browser session and navigates to the AI interface."""
+        self._cleanup_zombie_processes()
         self.playwright = await async_playwright().start()
         
         args = ['--disable-blink-features=AutomationControlled']
@@ -75,50 +88,133 @@ class GeminiAutomation:
         if not self.page:
             return "Error: Session not started."
             
-        chat_input_selector = 'div.ql-editor.textarea'
+        chat_input_selector = 'div.ql-editor, rich-textarea [contenteditable="true"], [data-test-id="chat-input"], [aria-label="Message Gemini"]'
         
         try:
+            # wait_for_selector on a comma-separated list will return when ANY of them is visible
             await self.page.wait_for_selector(chat_input_selector, state="visible", timeout=30000)
         except Exception:
              return "Error: Could not find chat input box. The page might not have loaded correctly."
              
         print(f"[System] Passing message to Igor and Nabu...")
-        # Fill clears existing text implicitly
-        await self.page.fill(chat_input_selector, prompt)
+        
+        # If the input is a contenteditable div, play it safe with keyboard typing instead of relying strictly on .fill() which sometimes bugs out on complex SPAs
+        await self.page.locator(chat_input_selector).first.click()
+        await self.page.keyboard.type(prompt, delay=5)
         
         # Submit the prompt
         await self.page.keyboard.press("Enter")
         
-        # --- 3. Wait for the Response ---
+        # --- 3 & 4. Wait for the Response and Extract Text ---
         print("[System] Waiting for Igor and Nabu to reply...")
-        await self.page.wait_for_timeout(2000)  # Short delay to allow the "Stop generating" button to appear
         
-        try:
-            # Look for the 'Stop generating' button. Wait for it to disappear.
-            stop_btn_selector = 'button[aria-label*="Stop generating"]'
-            if await self.page.query_selector(stop_btn_selector):
-                 await self.page.wait_for_selector(stop_btn_selector, state="hidden", timeout=90000)
-            else:
-                 # Check if it's still responding through network or other means.
-                 await self.page.wait_for_timeout(8000)
-        except Exception:
-            print("[!] Timeout waiting for reply. Attempting to extract text anyway...")
-
-        # --- 4. Extract Text ---
-        response_text = None
-        try:
-            # Gemini text is often in elements with the class 'message-content' or 'message-text'
-            responses = await self.page.query_selector_all('.message-content, message-content, .message-text, [class*="message-content"]')
+        # We will poll the text content of the latest model-response.
+        # Once it stops changing for 3 seconds, we assume generation is complete.
+        response_text = ""
+        stable_count = 0
+        
+        # Define JS script to safely locate the LAST top-level response string without nested child interference
+        js_extractor = """() => {
+            let responses = document.querySelectorAll('model-response, message-content, [class*="message-content"], [data-test-id="model-response"]');
+            let topLevel = Array.from(responses).filter(el => {
+                let parent = el.parentElement;
+                while(parent) {
+                    if (['model-response', 'message-content'].includes(parent.tagName.toLowerCase()) || 
+                        (parent.className && typeof parent.className === 'string' && parent.className.includes('message-content'))) {
+                        return false; // It's a nested child paragraph, skip!
+                    }
+                    parent = parent.parentElement;
+                }
+                return true;
+            });
+            if (topLevel.length > 0) {
+                return topLevel[topLevel.length - 1].innerText;
+            }
+            return "";
+        }"""
+        
+        for _ in range(60): # Max wait 60 seconds
+            await self.page.wait_for_timeout(1000)
             
-            if responses:
-                latest_response = responses[-1]
-                response_text = await latest_response.inner_text()
+            try:
+                current_text = await self.page.evaluate(js_extractor)
+            except Exception as e:
+                print(f"[!] Error executing JS extraction: {e}")
+                current_text = ""
+                
+            if current_text and len(current_text.strip()) > 10:
+                if current_text == response_text:
+                    stable_count += 1
+                    if stable_count >= 3:
+                        # Text hasn't changed in 3 seconds. It's done!
+                        print("[System] Received complete response.")
+                        break
+                else:
+                    stable_count = 0
+                    response_text = current_text
             else:
-                response_text = "Error: Could not locate the response text within expected <message-content> tags."
-        except Exception as e:
-            response_text = f"Error extracting text: {e}"
+                # Still waiting for response to appear or grow
+                pass
+                
+        if not response_text or not response_text.strip():
+            response_text = "Error: Could not locate the response text within expected DOM tags."
+            # Dump the DOM so we can inspect what elements Google is actually using right now
+            try:
+                html_content = await self.page.content()
+                with open("dom_dump.html", "w", encoding="utf-8") as f:
+                    f.write(html_content)
+                print("[!] Saved page source to dom_dump.html for debugging.")
+            except Exception as dump_e:
+                print(f"Failed to dump DOM: {dump_e}")
+                
+        # Clean up Gemini's new custom Gem UI header that gets prepended to the text
+        if response_text:
+            lines = response_text.strip().split('\n')
+            
+            # The header can sometimes span multiple lines (e.g. name on one line, "Gem" on another, then "said")
+            # We look for the "said" or "אמר" line within the first 5 lines
+            header_end_idx = -1
+            for i in range(min(5, len(lines))):
+                line_lower = lines[i].lower()
+                if ("igor, nabu" in line_lower or "gemini" in line_lower) and ("said" in line_lower or "אמר" in line_lower):
+                    header_end_idx = i
+                    break
+            
+            if header_end_idx != -1:
+                # Discard the header lines and any immediate blank lines following it
+                response_text = '\n'.join(lines[header_end_idx + 1:]).strip()
             
         return response_text
+
+    async def new_chat(self) -> bool:
+        """Clicks the 'New Chat' button in the Gemini UI to clear context."""
+        if not self.page:
+            return False
+            
+        print("[System] Attempting to start a new chat session...")
+        try:
+            # We look for the new chat button using its common data attributes or href
+            # Works across languages since it's structural
+            clicked = await self.page.evaluate("""() => {
+                let newChatBtn = document.querySelector('a[href="/app"], a[data-test-id="new-chat"]');
+                if (newChatBtn) {
+                    newChatBtn.click();
+                    return true;
+                }
+                return false;
+            }""")
+            
+            if clicked:
+                await self.page.wait_for_timeout(2000) # Wait for UI to reset
+                return True
+            else:
+                # Fallback: Just navigate to /app which forces a new chat
+                await self.page.goto("https://gemini.google.com/app", wait_until="domcontentloaded")
+                await self.page.wait_for_timeout(2000)
+                return True
+        except Exception as e:
+            print(f"[!] Error starting new chat: {e}")
+            return False
 
     async def close_session(self):
         """Closes the browser session."""
