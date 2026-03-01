@@ -83,8 +83,8 @@ class GeminiAutomation:
                 print("[System] Login detected. Proceeding...")
         return True
 
-    async def send_message(self, prompt: str) -> str:
-        """Sends a message in the active session and returns the extracted response text."""
+    async def send_message(self, prompt: str, file_path: str = None) -> str:
+        """Sends a message in the active session, optionally with a file, and returns the response text."""
         if not self.page:
             return "Error: Session not started."
             
@@ -98,9 +98,9 @@ class GeminiAutomation:
              
         print(f"[System] Passing message to Igor and Nabu...")
         
-        # If the input is a contenteditable div, play it safe with keyboard typing instead of relying strictly on .fill() which sometimes bugs out on complex SPAs
+        # Use insert_text to instantly paste the prompt (bypasses slow per-character typing)
         await self.page.locator(chat_input_selector).first.click()
-        await self.page.keyboard.type(prompt, delay=5)
+        await self.page.keyboard.insert_text(prompt)
         
         # Submit the prompt
         await self.page.keyboard.press("Enter")
@@ -133,7 +133,7 @@ class GeminiAutomation:
             return "";
         }"""
         
-        for _ in range(60): # Max wait 60 seconds
+        for _ in range(180): # Max wait 180 seconds
             await self.page.wait_for_timeout(1000)
             
             try:
@@ -171,12 +171,13 @@ class GeminiAutomation:
         if response_text:
             lines = response_text.strip().split('\n')
             
-            # The header can sometimes span multiple lines (e.g. name on one line, "Gem" on another, then "said")
-            # We look for the "said" or "אמר" line within the first 5 lines
+            # The header can span many lines now (name, "Gem", "data analysis", "query complete", then "said")
+            # We look for the line containing "אמר" (said) or "said" within the first 10 lines
             header_end_idx = -1
-            for i in range(min(5, len(lines))):
-                line_lower = lines[i].lower()
-                if ("igor, nabu" in line_lower or "gemini" in line_lower) and ("said" in line_lower or "אמר" in line_lower):
+            for i in range(min(10, len(lines))):
+                line_lower = lines[i].lower().strip()
+                # Match if line contains "אמר" (said in Hebrew) — this is the definitive end-of-header marker
+                if 'אמר' in line_lower or ('said' in line_lower and ('igor' in line_lower or 'nabu' in line_lower or 'gemini' in line_lower)):
                     header_end_idx = i
                     break
             
@@ -245,7 +246,7 @@ class GeminiAutomation:
         if not success:
             return "Failed to start session."
             
-        response_text = await self.send_message(prompt)
+        response_text = await self.send_message(prompt, file_path=None)
         
         await self.close_session()
         return response_text
